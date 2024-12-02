@@ -1,14 +1,15 @@
 from fastapi import FastAPI
 from openai import OpenAI
-from pydantic import BaseModel
+from tooldantic import OpenAiResponseFormatBaseModel as BaseModel
 import json, marqo
+import requests
 
 mq = marqo.Client(url="http://localhost:8882")
 
 class Themes(BaseModel):
     themes: list[str]
     emotions: list[str]
-    query_rewrite: list[str]
+    query_rewrite: str
 
 class FinalResponse(BaseModel):
     lyrics: str
@@ -16,10 +17,10 @@ class FinalResponse(BaseModel):
 
 app = FastAPI()
 
-keys = json.load(open("env/keys.json", "r"))
-client = OpenAI(
-    api_key=keys["OpenAI"]
-)
+# keys = json.load(open("env/keys.json", "r"))
+# client = OpenAI(
+#     api_key=keys["OpenAI"]
+# )
 
 @app.get("/get_quote")
 def get_quote(query: str):
@@ -35,21 +36,21 @@ def get_quote(query: str):
     results = search_marqo(themes)
     print(f"Search results from Marqo: {results}")
 
-    final_response = get_lyrics(results[0], themes)
-    return final_response # CHANGE THIS TO MORE USEABLE FROM THE FRONTEND
+    final_response = get_lyrics(results['title'], themes)
+    return final_response
 
 def get_themes(query):
     print(f"Getting themes for query: {query}")
-    response = client.completions.create(
-        model="gpt-4o-mini",
-        messages=[
+    payload = {
+        "model": "phi-3.1-mini-128k-instruct",
+        "messages": [
             {"role": "system", "content": """The user is looking for lyrics matching a specific theme or idea. Extract key themes and emotions. Provide output in JSON format:
 1. "themes" - High-level thematic keywords.
 2. "emotions" - Emotional undertones.
 3. "query_rewrite" - A rewritten version of the query optimized for semantic search.
 """},
             {"role": "user", "content": "Give me lyrics about achieving greatness"},
-            {"role": "assisant", "content": """
+            {"role": "assistant", "content": """
 {
   "themes": ["achievement", "greatness", "success"],
   "emotions": ["motivation", "triumph", "pride"],
@@ -57,7 +58,7 @@ def get_themes(query):
 }
 """},
             {"role": "user", "content": "What's a good song about heartbreak?"},
-            {"role": "assisant", "content": """
+            {"role": "assistant", "content": """
 {
   "themes": ["heartbreak", "loss", "grief"],
   "emotions": ["sadness", "melancholy", "longing"],
@@ -75,37 +76,48 @@ def get_themes(query):
 """},
             {"role": "user", "content": query}
         ],
-        max_new_tokens=1000,
-        response_format=Themes,
-    )
+        "max_new_tokens": 1000,
+        "response_format": Themes.model_json_schema()
+    }
 
-    themes = response.choices[0].message.content
-    print(f"Received themes from OpenAI: {themes}")
+    response = requests.post("http://127.0.0.1:1234/v1/chat/completions", json=payload)
+    response_json = response.json()
+    themes = response_json["choices"][0]["message"]["content"]
+    print(f"Received themes from local model: {themes}")
     return themes
 
 def search_marqo(query):
     print(f"Searching Marqo with query: {query}")
-    results = mq.index("song").search(
+    results = mq.index("songs").search(
         q=query,
-        searchable_attributes=["lyrics", "themes", "summary", "tone"],
-        boosts={"lyrics": 1, "themes": 1.5, "tone": 1.5},
-        limit=5
+        searchable_attributes=["original_lyrics", "themes", "summary", "tone"],
+        attributes_to_retrieve=["title", "lyrics"]
     )
 
     print(f"Marqo search results: {results}")
-    return results["hit"]
+    return results["hits"][0]
 
 def get_lyrics(query, themes):
     print(f"Getting lyrics for query: {query} with themes: {themes}")
-    response = client.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "The user is looking for some lyrics to match a prompt in their song. Provide the lyrics in response. Keep in mind that the user's inputs have been formatted into JSON to allow easy use. Also make sure that you provide the name of the song, which you should already be given"},
-            {"role": "user", "content": f"I have the song: {query} and want to find out about {themes}"}
+    with open("master_songs.json", "r") as f:
+        songs = json.load(f)
+    song = songs[query]['original_lyrics']
+    payload = {
+        "model": "phi-3.1-mini-128k-instruct",
+        "messages": [
+            {"role": "system", "content": "The user is looking for some lyrics to match a prompt in their song. Provide the lyrics in response. Keep in mind that the user's inputs have been formatted into JSON to allow easy use. Also make sure that you provide the name of the song, which you should already be given. Keep the selected portion of the song short, returning less than  30 words. And only return lyrics from the song, nothing else."},
+            {"role": "user", "content": f"I have the song: {song} and want to find out about {themes}"}
         ],  
-        response_format=FinalResponse,
-    )
+        "response_format": FinalResponse.model_json_schema(),
+        "max_new_tokens": 250
+    }
+    response = requests.post("http://127.0.0.1:1234/v1/chat/completions", json=payload)
+    response_json = response.json()
+    output = response_json["choices"][0]["message"]["content"]
+    output_json = json.loads(output)
+    print(f"Received lyrics: {output_json}")
+    return output_json
 
-    lyrics = response.choices[0].message.content
-    print(f"Received lyrics from OpenAI: {lyrics}")
-    return lyrics
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
